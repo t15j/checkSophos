@@ -18,6 +18,7 @@ CRIT_MEDIUM_ALERTS = 10
 # Zeitraum für Alert-Abfrage
 LOOKBACK_HOURS = 24
 
+
 def checkmk_output(state, service, perfdata, text):
     print(f'{state} "{service}" {perfdata} {text}')
 
@@ -59,6 +60,54 @@ def get_tenant_info(token):
     r = requests.get(WHOAMI_URL, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
+
+def get_cases(token, tenant_id, api_host):
+    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+
+    url = f"{api_host}/cases/v1/cases"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Tenant-ID": tenant_id,
+        "Accept": "application/json"
+    }
+
+    params = {
+        "from": since.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "pageSize": 50,
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+
+    if not r.ok:
+        raise Exception(
+            f"Sophos Cases request failed: HTTP {r.status_code} - {r.text}"
+        )
+
+    return r.json().get("items", [])
+
+def get_siem_events(token, tenant_id, api_host):
+    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+
+    url = f"{api_host}/siem/v1/events"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Tenant-ID": tenant_id,
+        "Accept": "application/json"
+    }
+
+    params = {
+        "from_date": int(since.timestamp()),
+        "limit": 1000
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+
+    if not r.ok:
+        raise Exception(
+            f"Sophos SIEM events request failed: HTTP {r.status_code} - {r.text}"
+        )
+
+    return r.json().get("items", [])
 
 
 def get_alerts(token, tenant_id, api_host):
@@ -124,7 +173,43 @@ def main():
             f"total={total}, high={high}, medium={medium}, low={low}"
         )
 
-        checkmk_output(state, "Sophos XDR Alerts", perfdata, text)
+        events = get_siem_events(token, tenant_id, api_host)
+
+        # High-Severity Events filtern
+        high_events = [
+            e for e in events
+            if e.get("severity") in ("high", "High") 
+            or e.get("type") == "Event::Endpoint::Threat::Detected"
+        ]
+
+        high_event_count = len(high_events)
+
+        # In State-Berechnung einbeziehen
+        if high_event_count >= CRIT_HIGH_ALERTS:
+            state = 2
+        elif high_event_count >= WARN_HIGH_ALERTS:
+            state = 1
+
+        # In perfdata und text ergänzen
+        perfdata += f"'high_events'={high_event_count};{WARN_HIGH_ALERTS};{CRIT_HIGH_ALERTS};0;"
+        text += f", high_events={high_event_count}"
+
+        cases = get_cases(token, tenant_id, api_host)
+        case_count = sum(1 for c in cases if c.get("status", "").lower() in ("new", "investigating"))
+
+        # Cases in State-Berechnung einbeziehen
+        WARN_CASES = 1
+        CRIT_CASES = 3
+
+        if case_count >= CRIT_CASES:
+            state = 2
+        elif case_count >= WARN_CASES:
+            state = 1
+
+        # In perfdata und text ergänzen
+        perfdata += f"'cases'={case_count};{WARN_CASES};{CRIT_CASES};0;"
+        text += f", cases={case_count}"
+
         nagios_exit(state, text, perfdata)
 
     except requests.exceptions.HTTPError as e:
